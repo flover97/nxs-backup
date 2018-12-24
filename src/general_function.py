@@ -85,6 +85,8 @@ def get_time_now(unit):
         result = now.strftime("%d")
     elif unit == "dow":  # Day of the week
         result = now.strftime("%u")
+    elif unit == "doy":  # Day of the year
+        result = now.strftime("%j")
     elif unit == "moy":  # Month of the year
         result = now.strftime("%m")
     elif unit == "year":
@@ -93,6 +95,9 @@ def get_time_now(unit):
         result = now.strftime("%Y-%m-%d %H:%M:%S")
     elif unit == "backup":  # Full date for dump name
         result = now.strftime("%Y-%m-%d_%H-%M")
+    elif unit == "period":  # Full date for period name
+        result = now.strftime("%Y%m%d")
+
     return result
 
 
