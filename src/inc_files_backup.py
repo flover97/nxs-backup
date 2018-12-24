@@ -6,6 +6,7 @@ import os
 import json
 import fnmatch
 import tarfile
+import math
 
 import general_function
 import general_files_func
@@ -24,11 +25,12 @@ def inc_files_backup(job_data):
         job_name = job_data['job']
         sources = job_data['sources']
         storages = job_data['storages']
+        rotation = job_data['rotation']
     except KeyError as e:
         log_and_mail.writelog('ERROR', "Missing required key:'%s'!" %(e),
                               config.filelog_fd, job_name)
         return 1
-
+    
     for i in range(len(sources)):
         target_list = sources[i]['target']
         exclude_list = sources[i].get('excludes', '')
@@ -96,7 +98,7 @@ def inc_files_backup(job_data):
                                     if not storage in ('local', 'scp', 'nfs'):
                                         local_dst_dirname = os.path.join(local_dst_dirname, backup_dir.lstrip('/'))
 
-                                    create_inc_file(local_dst_dirname, remote_dir, part_of_dir_path, backup_file_name, i, exclude_list, gzip, job_name, storage, host, share) #general_inc_iteration
+                                    create_inc_file(local_dst_dirname, remote_dir, part_of_dir_path, backup_file_name, i, exclude_list, gzip, job_name, storage, host, share, rotation) #general_inc_iteration
 
                                     try:
                                         mount_fuse.unmount()
@@ -109,33 +111,82 @@ def inc_files_backup(job_data):
                 else:
                     continue
 
+def del_old_dirs(dirs,cnt):
+    if len(dirs) > cnt :
+        oldest_dir = min(dirs, key=os.path.getmtime)
+        general_function.del_file_objects('inc_files', oldest_dir)
+        dirs.remove(oldest_dir)
+        del_old_dirs(dirs,cnt)
+    return True
 
 def create_inc_file(local_dst_dirname, remote_dir, part_of_dir_path, backup_file_name,
-                    target, exclude_list, gzip, job_name, storage, host, share):
+                    target, exclude_list, gzip, job_name, storage, host, share, rotation):
     ''' The function determines whether to collect a full backup or incremental,
     prepares all the necessary information.
 
     '''
+    period = rotation['period']
+    count = rotation['count']
+    recreate_interval = rotation['recreate_interval']
 
     date_year = general_function.get_time_now('year')
     date_month = general_function.get_time_now('moy')
-    date_day = general_function.get_time_now('dom')
-
-    if  int(date_day) < 11:
-        daily_prefix = 'day_01'
-    elif int(date_day) < 21:
-        daily_prefix = 'day_11'
-    else:
-        daily_prefix = 'day_21'
+    date_day_of_month = general_function.get_time_now('dom')
+    date_day_of_year = general_function.get_time_now('doy')
+    date_period = general_function.get_time_now('period')
 
     year_dir = os.path.join(local_dst_dirname, part_of_dir_path, date_year)
-    initial_dir = os.path.join(year_dir, 'year')  # Path to full backup
     month_dir = os.path.join(year_dir, 'month_%s' %(date_month), 'monthly')
-    daily_dir = os.path.join(year_dir, 'month_%s' %(date_month), 'daily', daily_prefix)
+    top_period_dir = os.path.join(year_dir, 'full')
 
-    year_inc_file  =  os.path.join(initial_dir, 'year.inc')
+    if period == 'day':
+        daily_dir = os.path.join(year_dir, 'day_%s'%(date_day_of_year))
+        current_backup_dir = daily_dir # Contains the name of the backup directory that is currently being assembled, it is necessary for the correct rotation
+    else:
+        current_backup_dir = os.path.join(year_dir, 'month_%s' %(date_month))
+        if int(date_day_of_month) < 11:
+            daily_dir = os.path.join(year_dir, 'month_%s' %(date_month), 'daily', 'day_01')
+        elif int(date_day_of_month) < 21:
+            daily_dir = os.path.join(year_dir, 'month_%s' %(date_month), 'daily', 'day_11')
+        else:
+            daily_dir = os.path.join(year_dir, 'month_%s' %(date_month), 'daily', 'day_21')
+
+    if os.path.isdir(top_period_dir):
+        period_count = math.ceil(count/recreate_interval) # Variable to control the number of full copies
+        backups_dirs = [os.path.join(year_dir,x) for x in os.listdir(year_dir) if os.path.join(year_dir, x) != top_period_dir] # All backup directories(2018/day_ or 2018/month_)
+        period_dirs = [os.path.join(top_period_dir,d) for d in os.listdir(top_period_dir)] # All directories with full copies
+        period_dirs.sort(key=os.path.getctime)
+        last_period_dir_ctime = os.path.getctime(period_dirs[-1]) # Last full backup time
+        backup_dirs_older_last_period_dir = [x for x in backups_dirs if os.path.getctime(x) >= last_period_dir_ctime] # All directories with full copies that were created after half a day full copies
+
+        try :
+            oldest_period_dir_ctime = os.path.getctime(period_dirs[-period_count]) # The time to create the oldest full copy, the copy is defined as the total number of full copies -perido_count
+        except:
+            oldest_period_dir_ctime = os.path.getctime(period_dirs[-1]) # Since the original copy with the index (-period_count) may not be, the oldest full copy is taken as the basis
+
+        backup_dirs_older_oldest_period_dir = [x for x in backups_dirs if os.path.getctime(x) < oldest_period_dir_ctime] # All backup directories that were created before the oldest_period_dir_ctime
+        
+
+        if current_backup_dir not in backup_dirs_older_last_period_dir: # If current_backup_dir is not in the list backup_dirs_older_last_period_dir, then current_backup_dir is added there, for more correct rotation
+            backup_dirs_older_last_period_dir.append(current_backup_dir)
+            count -= 1 # Due to the fact that the current directory, which has not yet been created, has already been added to the list, it is necessary to lower the count for correct rotation
+
+        if len(backup_dirs_older_last_period_dir) > recreate_interval:
+            initial_dir = os.path.join(year_dir, top_period_dir, 'period_begins_from-%s' %(date_period))
+            del_old_dirs(backups_dirs,count)
+            if len(backup_dirs_older_oldest_period_dir) == 0 : # If the number of backups older than the oldest_period_dir_ctime is 0, then you can cause the deletion of the oldest full copy
+                del_old_dirs(period_dirs,period_count)
+        else:
+            initial_dir = max(period_dirs, key=os.path.getmtime)
+            del_old_dirs(backups_dirs,count)
+            if len(backup_dirs_older_oldest_period_dir) == 0 : # If the number of backups older than the oldest_period_dir_ctime is 0, then you can cause the deletion of the oldest full copy
+                del_old_dirs(period_dirs,period_count)
+    else:
+        initial_dir = os.path.join(year_dir, top_period_dir, 'period_begins_from-%s' %(date_period))
+         
+    full_inc_file  =  os.path.join(initial_dir, 'full.inc')
     month_inc_file =  os.path.join(month_dir, 'month.inc')
-    daily_inc_file =  os.path.join(daily_dir, 'daily.inc') 
+    daily_inc_file =  os.path.join(daily_dir, 'daily.inc')
 
     link_dict = {}  # dict for symlink with pairs like dst: src
     copy_dict = {}  # dict for copy with pairs like dst: src
@@ -143,21 +194,15 @@ def create_inc_file(local_dst_dirname, remote_dir, part_of_dir_path, backup_file
     # Before we proceed to collect a copy, we need to delete the copies for the same month last year
     # if they are to not save extra archives
 
-    old_year = int(date_year) - 1
-    old_year_dir = os.path.join(local_dst_dirname, part_of_dir_path, str(old_year))
-    if os.path.isdir(old_year_dir):
-        old_month_dir = os.path.join(old_year_dir, 'month_%s' %(date_month))  
-        del_old_inc_file(old_year_dir, old_month_dir)
-
-    if not os.path.isfile(year_inc_file):
+    if not os.path.isfile(full_inc_file):
         # There is no original index file, so we need to check the existence of an year directory
-        if os.path.isdir(year_dir):
+        if os.path.isdir(initial_dir):
             # There is a directory, but there is no file itself, then something went wrong, so
             # we delete this directory with all the data inside, because even if they are there
             # continue to collect incremental copies it will not be able to
-            general_function.del_file_objects(job_name, year_dir)
-            dirs_for_log = general_function.get_dirs_for_log(year_dir, remote_dir, storage)
-            file_for_log = os.path.join(dirs_for_log, os.path.basename(year_inc_file))
+            general_function.del_file_objects(job_name, initial_dir)
+            dirs_for_log = general_function.get_dirs_for_log(initial_dir, remote_dir, storage)
+            file_for_log = os.path.join(dirs_for_log, os.path.basename(full_inc_file))
             log_and_mail.writelog('ERROR', "The file %s not found, so the directory %s is cleared." +\
                                   "Incremental backup will be reinitialized " %(file_for_log, dirs_for_log), 
                                   config.filelog_fd, job_name)
@@ -168,7 +213,7 @@ def create_inc_file(local_dst_dirname, remote_dir, part_of_dir_path, backup_file
 
         # Get the current list of files and write to the year inc file
         meta_info = get_index(target, exclude_list)
-        with open(year_inc_file, "w") as index_file:
+        with open(full_inc_file, "w") as index_file:
             json.dump(meta_info, index_file)
 
         full_backup_path = general_function.get_full_path(  initial_dir,
@@ -185,69 +230,96 @@ def create_inc_file(local_dst_dirname, remote_dir, part_of_dir_path, backup_file
         # as well as in the decade directory if it's local, scp the repository and
         # copy inc.file for other types of repositories that do not support symlynk.
 
-        month_dirs_for_log = general_function.get_dirs_for_log(month_dir, remote_dir, storage)
-        daily_dirs_for_log = general_function.get_dirs_for_log(daily_dir, remote_dir, storage)
-        general_function.create_dirs(job_name=job_name, dirs_pairs={month_dir:month_dirs_for_log,
+        if period == 'day':
+            daily_dirs_for_log = general_function.get_dirs_for_log(daily_dir, remote_dir, storage)
+            general_function.create_dirs(job_name=job_name, dirs_pairs={daily_dir:daily_dirs_for_log})
+        else:
+            month_dirs_for_log = general_function.get_dirs_for_log(month_dir, remote_dir, storage)
+            daily_dirs_for_log = general_function.get_dirs_for_log(daily_dir, remote_dir, storage)
+            general_function.create_dirs(job_name=job_name, dirs_pairs={month_dir:month_dirs_for_log,
                                                                     daily_dir:daily_dirs_for_log})
 
         if storage in 'local, scp':
-            link_dict[month_inc_file] = year_inc_file
-            link_dict[os.path.join(month_dir, os.path.basename(full_backup_path))] = full_backup_path
-            link_dict[daily_inc_file] = year_inc_file
-            link_dict[os.path.join(daily_dir, os.path.basename(full_backup_path))] = full_backup_path
+            if period == 'day':
+                link_dict[daily_inc_file] = full_inc_file
+                link_dict[os.path.join(daily_dir, os.path.basename(full_backup_path))] = full_backup_path
+            else:
+                link_dict[month_inc_file] = full_inc_file
+                link_dict[os.path.join(month_dir, os.path.basename(full_backup_path))] = full_backup_path
+                link_dict[daily_inc_file] = full_inc_file
+                link_dict[os.path.join(daily_dir, os.path.basename(full_backup_path))] = full_backup_path
         else:
-            copy_dict[month_inc_file] = year_inc_file
-            copy_dict[daily_inc_file] = year_inc_file
+            if period == 'day':
+                copy_dict[daily_inc_file] = full_inc_file
+            else:
+                copy_dict[month_inc_file] = full_inc_file
+                copy_dict[daily_inc_file] = full_inc_file
     else:
         symlink_dir = ''
-        if int(date_day) == 1:
-            # It is necessary to collect monthly incremental backup relative to the year copy
-            old_meta_info = specific_function.parser_json(year_inc_file)
-            new_meta_info = get_index(target, exclude_list)
 
-            general_inc_backup_dir = month_dir
-
-            # It is also necessary to make a symlink for inc files and backups to the directory with the first decade
-            symlink_dir = daily_dir
-
-            general_dirs_for_log = general_function.get_dirs_for_log(general_inc_backup_dir, remote_dir, storage)
-            symlink_dirs_for_log = general_function.get_dirs_for_log(symlink_dir, remote_dir, storage)
-            general_function.create_dirs(job_name=job_name, dirs_pairs={general_inc_backup_dir:general_dirs_for_log, symlink_dir:symlink_dirs_for_log})
-
-            with open(month_inc_file, "w") as index_file:
-                json.dump(new_meta_info, index_file)
-
-        elif int(date_day) == 11 or int(date_day) == 21:
-            # It is necessary to collect a ten-day incremental backup relative to a monthly copy
-            try:
-                old_meta_info = specific_function.parser_json(month_inc_file)
-            except general_function.MyError as e:
-                log_and_mail.writelog('ERROR', "Couldn't open old month meta info file '%s': %s!" %(month_inc_file, e),
-                                     config.filelog_fd, job_name)
-                return 2
-
+        if period == 'day':
+            old_meta_info = specific_function.parser_json(full_inc_file)
             new_meta_info = get_index(target, exclude_list)
 
             general_inc_backup_dir = daily_dir
-            general_dirs_for_log = general_function.get_dirs_for_log(general_inc_backup_dir, remote_dir, storage)
-            general_function.create_dirs(job_name=job_name, dirs_pairs={general_inc_backup_dir:general_dirs_for_log}) 
 
-            with open(daily_inc_file, "w") as index_file:
-                json.dump(new_meta_info, index_file)
-        else:
-            # It is necessary to collect a normal daily incremental backup relative to a ten-day copy
-            try:
-                old_meta_info = specific_function.parser_json(daily_inc_file)
-            except general_function.MyError as e:
-                log_and_mail.writelog('ERROR', "Couldn't open old decade meta info file '%s': %s!" %(daily_inc_file, e),
-                                     config.filelog_fd, job_name)
-                return 2
-
-            new_meta_info = get_index(target, exclude_list)
-
-            general_inc_backup_dir = daily_dir
             general_dirs_for_log = general_function.get_dirs_for_log(general_inc_backup_dir, remote_dir, storage)
             general_function.create_dirs(job_name=job_name, dirs_pairs={general_inc_backup_dir:general_dirs_for_log})
+
+            if not os.path.isfile(daily_inc_file):
+                with open(daily_inc_file, "w") as index_file:
+                    json.dump(new_meta_info, index_file)
+        else:
+            if int(date_day_of_month) == 1:
+                # It is necessary to collect monthly incremental backup relative to the year copy
+                old_meta_info = specific_function.parser_json(full_inc_file)
+                new_meta_info = get_index(target, exclude_list)
+
+                general_inc_backup_dir = month_dir
+
+                # It is also necessary to make a symlink for inc files and backups to the directory with the first decade
+                symlink_dir = daily_dir
+
+                general_dirs_for_log = general_function.get_dirs_for_log(general_inc_backup_dir, remote_dir, storage)
+                symlink_dirs_for_log = general_function.get_dirs_for_log(symlink_dir, remote_dir, storage)
+                general_function.create_dirs(job_name=job_name, dirs_pairs={general_inc_backup_dir:general_dirs_for_log, symlink_dir:symlink_dirs_for_log})
+
+                with open(month_inc_file, "w") as index_file:
+                    json.dump(new_meta_info, index_file)
+
+            elif int(date_day_of_month) == 11 or int(date_day_of_month) == 21:
+                # It is necessary to collect a ten-day incremental backup relative to a monthly copy
+                
+                try:
+                    old_meta_info = specific_function.parser_json(month_inc_file)
+                except general_function.MyError as e:
+                    log_and_mail.writelog('ERROR', "Couldn't open old month meta info file '%s': %s!" %(month_inc_file, e),
+                                        config.filelog_fd, job_name)
+                    return 2
+
+                new_meta_info = get_index(target, exclude_list)
+
+                general_inc_backup_dir = daily_dir
+                general_dirs_for_log = general_function.get_dirs_for_log(general_inc_backup_dir, remote_dir, storage)
+                general_function.create_dirs(job_name=job_name, dirs_pairs={general_inc_backup_dir:general_dirs_for_log}) 
+
+                with open(daily_inc_file, "w") as index_file:
+                    json.dump(new_meta_info, index_file)
+            else:
+                # It is necessary to collect a normal daily incremental backup relative to a ten-day copy
+                
+                try:
+                    old_meta_info = specific_function.parser_json(daily_inc_file)
+                except general_function.MyError as e:
+                    log_and_mail.writelog('ERROR', "Couldn't open old decade meta info file '%s': %s!" %(daily_inc_file, e),
+                                        config.filelog_fd, job_name)
+                    return 2
+
+                new_meta_info = get_index(target, exclude_list)
+
+                general_inc_backup_dir = daily_dir
+                general_dirs_for_log = general_function.get_dirs_for_log(general_inc_backup_dir, remote_dir, storage)
+                general_function.create_dirs(job_name=job_name, dirs_pairs={general_inc_backup_dir:general_dirs_for_log})
 
 
         # Calculate the difference between the old and new file states
@@ -310,16 +382,6 @@ def create_inc_file(local_dst_dirname, remote_dir, part_of_dir_path, backup_file
             except general_function.MyError as err:
                 log_and_mail.writelog('ERROR', "Can't copy %s -> %s: %s" %(src, dst, err),
                                       config.filelog_fd, job_name)
-
-
-def del_old_inc_file(old_year_dir, old_month_dir):
-    general_function.del_file_objects('inc_files', old_month_dir)
-
-    list_subdir_in_old_dir = os.listdir(old_year_dir)
-
-    if len(list_subdir_in_old_dir) == 1 and list_subdir_in_old_dir[0] == 'year':
-        general_function.del_file_objects('inc_files', old_year_dir)
-
 
 def get_gnu_dumpdir_format(diff_json, dir_name, backup_dir, excludes, first_level_subdirs, first_level_files):
     ''' The function on the input receives a dictionary with modified files.
@@ -451,3 +513,5 @@ def create_inc_tar(path_to_tarfile, remote_dir, dict_directory, target_change_li
             log_and_mail.writelog('INFO', "Successfully created incremental '%s' archive on '%s' storage(%s)." %(file_for_log, storage, host),
                                 config.filelog_fd, job_name)
         return True
+
+
