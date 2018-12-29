@@ -133,7 +133,8 @@ def create_tar(job_type, backup_full_path, target, gzip, backup_type, job_name,
             out_tarfile = tarfile.open(backup_full_path, mode='w:')
 
         if job_type == 'files':
-            out_tarfile.add(target, filter=filter_function)
+            if os.path.exists(target):
+                out_tarfile.add(target, filter=filter_function)
         elif job_type == 'databases':
             out_tarfile.add(target)
 
